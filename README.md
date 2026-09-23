@@ -1,4 +1,4 @@
-# UL: Defender for Cloud Apps - Unsanctioned Apps Export Tool
+# UL: Defender for Cloud Apps - Unsanctioned Apps Bulk Export Script
 
 PowerShell helpers for Microsoft Defender for Cloud Apps / Microsoft security portal workflows.
 
