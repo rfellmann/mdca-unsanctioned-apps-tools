@@ -13,3 +13,4 @@ PowerShell helpers for Microsoft Defender for Cloud Apps / Microsoft security po
 2. Copy the `sccauth` and `XSRF-TOKEN` values.
 3. Paste those values into the configuration block at the top of `Get-SanctionedMDCAApps.ps1`.
 4. Add your tenant ID in the same configuration block.
+5. Run `Get-SanctionedMDCAApps.ps1` and wait for the export to complete. Depending on the number of unsanctioned apps, this can take several minutes.
