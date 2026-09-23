@@ -16,4 +16,5 @@ PowerShell helpers for Microsoft Defender for Cloud Apps / Microsoft security po
 5. Run `Get-SanctionedMDCAApps.ps1` and wait for the export to complete. Depending on the number of unsanctioned apps, this can take several minutes.
 
 
-## These are custom scripts and not an official Microsoft product; no support is provided by Microsoft.
+## Support Statement
+- These are custom scripts and not an official Microsoft product; no support is provided by Microsoft.
