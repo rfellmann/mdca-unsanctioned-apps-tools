@@ -8,6 +8,7 @@
 #
 # Safety:
 # - Read-only: this script does not sanction, unsanction, delete, or modify any apps.
+# - This is a custom script and is not an official Microsoft product; no support is provided by Microsoft.
 # - Do not commit real sccauth, XSRF-TOKEN, tenant, or customer-specific values.
 
 # ====================================================================

@@ -8,6 +8,7 @@ Capabilities:
 - Avoids external SQLite dependencies by using the browser DevTools protocol.
 
 Safety:
+- This is a custom script and is not an official Microsoft product; no support is provided by Microsoft.
 - Does not send cookie values anywhere except the local clipboard when a copy button is clicked.
 - Close the dedicated Edge window when finished and avoid sharing copied cookie values.
 #>
