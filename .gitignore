@@ -1,0 +1,6 @@
+*.log
+*.csv
+*.tsv
+MDCA_UnsanctionedApps_Log_*.txt
+MDCA_UnsanctionedApps_*.csv
+MDCA_UnsanctionedApps_*.tsv
