@@ -13,5 +13,3 @@ PowerShell helpers for Microsoft Defender for Cloud Apps / Microsoft security po
 2. Copy the `sccauth` and `XSRF-TOKEN` values.
 3. Paste those values into the configuration block at the top of `Get-SanctionedMDCAApps.ps1`.
 4. Add your tenant ID in the same configuration block.
-
-Do not commit real cookie values or tenant/customer-specific data.
