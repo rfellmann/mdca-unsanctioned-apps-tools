@@ -1,6 +1,14 @@
 # Get-SanctionedMDCAApps.ps1
-# Read-only: returns all unsanctioned (banned) app entries in Microsoft Defender for Cloud Apps using Cookie Authentication
-# This script does NOT sanction or unsanction any apps.
+#
+# Capabilities:
+# - Connects to Microsoft Defender for Cloud Apps through security.microsoft.com cookie authentication.
+# - Retrieves unsanctioned/banned cloud app entries, including domains from discovery block scripts.
+# - Resolves discovered domains against the Cloud App Catalog where possible to include app names and app IDs.
+# - Groups domains into Excel-friendly app/domain rows and exports CSV/TSV output for review.
+#
+# Safety:
+# - Read-only: this script does not sanction, unsanction, delete, or modify any apps.
+# - Do not commit real sccauth, XSRF-TOKEN, tenant, or customer-specific values.
 
 # ====================================================================
 # CONFIGURATION - PASTE YOUR VALUES BELOW

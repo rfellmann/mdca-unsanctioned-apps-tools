@@ -1,3 +1,17 @@
+<#
+Get-MDCACookies.ps1
+
+Capabilities:
+- Opens security.microsoft.com in a dedicated Microsoft Edge session with local DevTools enabled.
+- Extracts the security portal sccauth and XSRF-TOKEN cookies from that signed-in browser session.
+- Displays separate copy buttons for each cookie so the values can be pasted into Get-SanctionedMDCAApps.ps1.
+- Avoids external SQLite dependencies by using the browser DevTools protocol.
+
+Safety:
+- Does not send cookie values anywhere except the local clipboard when a copy button is clicked.
+- Close the dedicated Edge window when finished and avoid sharing copied cookie values.
+#>
+
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
