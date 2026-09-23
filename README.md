@@ -6,6 +6,7 @@ PowerShell helpers for Microsoft Defender for Cloud Apps / Microsoft security po
 
 - `Get-SanctionedMDCAApps.ps1` exports unsanctioned app/domain results in an Excel-friendly format.
 - `Get-MDCACookies.ps1` opens `security.microsoft.com`, extracts the required session cookies from that controlled browser session, and provides separate copy buttons for `sccauth` and `XSRF-TOKEN`.
+- Scripts are custom built - no support from Microsoft. 
 
 ## Before Running
 
