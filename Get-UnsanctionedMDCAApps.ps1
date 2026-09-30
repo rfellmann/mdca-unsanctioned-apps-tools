@@ -325,7 +325,7 @@ function Get-AllAppCatalogApps {
     param([Microsoft.PowerShell.Commands.WebRequestSession]$Session)
     
     $skip = 0
-    $limit = 100
+    $limit = 250
     $allCatalogApps = @()
     
     while ($true) {
@@ -337,56 +337,26 @@ function Get-AllAppCatalogApps {
         
         $response = Invoke-MDCAProxyApi -Endpoint "discovery/app_catalog/" -Method "POST" -Body $body -Session $Session
         
-        if ($response -and $response.data -and $response.data.Count -gt 0) {
-            $allCatalogApps += $response.data
-            
-            if ($response.data.Count -lt $limit) {
-                break
-            }
-            
-            $skip += $limit
-            Write-Host "." -NoNewline
-        } else {
+        if ($null -eq $response) {
+            throw "Failed to retrieve the Cloud App Catalog at offset $skip; stopping to avoid incomplete domain matching."
+        }
+        if ($response.PSObject.Properties.Name -notcontains 'data') {
+            throw "The Cloud App Catalog response at offset $skip did not contain a data field."
+        }
+        if ($response.data.Count -eq 0) {
             break
         }
+
+        $allCatalogApps += $response.data
+        if ($response.data.Count -lt $limit) {
+            break
+        }
+
+        $skip += $limit
+        Write-Host "." -NoNewline
     }
     
     return $allCatalogApps
-}
-
-function Get-AppCatalogAppByDomain {
-    param(
-        [string]$Domain,
-        [Microsoft.PowerShell.Commands.WebRequestSession]$Session
-    )
-    
-    if ([string]::IsNullOrWhiteSpace($Domain)) {
-        return $null
-    }
-    
-    if ($null -eq $script:CatalogDomainCache) {
-        $script:CatalogDomainCache = @{}
-    }
-    
-    $normalizedDomain = $Domain.ToLowerInvariant().Trim()
-    if ($script:CatalogDomainCache.ContainsKey($normalizedDomain)) {
-        return $script:CatalogDomainCache[$normalizedDomain]
-    }
-    
-    $body = @{
-        "filters" = @{
-            "domainList" = @{
-                "eq" = $normalizedDomain
-            }
-        }
-        "skip"    = 0
-        "limit"   = 1
-    }
-    
-    $response = Invoke-MDCAProxyApi -Endpoint "discovery/app_catalog/" -Method "POST" -Body $body -Session $Session
-    $app = if ($response -and $response.data -and $response.data.Count -gt 0) { @($response.data)[0] } else { $null }
-    $script:CatalogDomainCache[$normalizedDomain] = $app
-    return $app
 }
 
 # Match one discovered-app page against the global block list.
@@ -446,11 +416,38 @@ function Get-UnmatchedBlockDomainApps {
     )
 
     $unsanctioned = @()
+    $remainingDomains = @($BlockDomains | Where-Object { -not $MatchedDomains.ContainsKey($_) })
     $catalogMatchesByAppId = @{}
 
-    foreach ($domain in @($BlockDomains | Where-Object { -not $MatchedDomains.ContainsKey($_) })) {
-        $catalogApp = Get-AppCatalogAppByDomain -Domain $domain -Session $Session
-        if ($catalogApp -and $catalogApp.appId) {
+    if ($remainingDomains.Count -gt 0) {
+        Write-Log "Loading the Cloud App Catalog once to resolve $($remainingDomains.Count) remaining blocked domains..."
+        $allCatalogApps = @(Get-AllAppCatalogApps -Session $Session)
+        $catalogAppsByDomain = @{}
+
+        foreach ($catalogApp in $allCatalogApps) {
+            $catalogDomains = @()
+            if ($catalogApp.PSObject.Properties.Name -contains 'domainList' -and $catalogApp.domainList) {
+                $catalogDomains = @(Get-DomainsFromValue -Value $catalogApp.domainList)
+            }
+
+            foreach ($catalogDomain in $catalogDomains) {
+                $normalizedCatalogDomain = $catalogDomain.ToLowerInvariant().Trim()
+                if (-not $catalogAppsByDomain.ContainsKey($normalizedCatalogDomain)) {
+                    $catalogAppsByDomain[$normalizedCatalogDomain] = $catalogApp
+                }
+            }
+        }
+
+        foreach ($domain in $remainingDomains) {
+            if (-not $catalogAppsByDomain.ContainsKey($domain)) {
+                continue
+            }
+
+            $catalogApp = $catalogAppsByDomain[$domain]
+            if (-not $catalogApp.appId) {
+                continue
+            }
+
             $catalogAppKey = "appId:$($catalogApp.appId)"
             if (-not $catalogMatchesByAppId.ContainsKey($catalogAppKey)) {
                 $catalogMatchesByAppId[$catalogAppKey] = [pscustomobject]@{
@@ -458,7 +455,7 @@ function Get-UnmatchedBlockDomainApps {
                     Domains = New-Object System.Collections.Generic.List[string]
                 }
             }
-            
+
             $catalogMatchesByAppId[$catalogAppKey].Domains.Add($domain)
             $MatchedDomains[$domain] = $true
         }
@@ -700,7 +697,7 @@ $session.Cookies.Add($cookie2)
 
 # Test API connection
 Write-Log "Testing API connection..."
-$testBody = @{ "filters" = @{}; "skip" = 0; "limit" = 1 }
+$testBody = @{ "filters" = @{}; "skip" = 0; "limit" = 250 }
 $testResponse = Invoke-MDCAProxyApi -Endpoint "discovery/discovered_apps/" -Method "POST" -Body $testBody -Session $session
 
 if ($null -eq $testResponse) {
@@ -717,6 +714,11 @@ if ($null -eq $testResponse) {
     Write-Log "  4. Your session hasn't expired (re-run the JavaScript in browser)" -Level "ERROR"
     exit 1
 }
+if ($testResponse.PSObject.Properties.Name -notcontains 'data') {
+    Write-Log "API response did not contain discovered-app data." -Level "ERROR"
+    exit 1
+}
+$initialDiscoveredApps = @($testResponse.data)
 Write-Log "API Connection Successful!" -Level "SUCCESS"
 
 # Fetch discovered apps in pages, but create exports in batches of 250 unsanctioned results.
@@ -731,9 +733,16 @@ $exportBatchSize = 250
 $exportBatchNumber = 1
 $runId = Get-Date -Format 'yyyyMMdd_HHmmss'
 $skip = 0
+$useInitialDiscoveredPage = $true
 
 while ($true) {
-    $pageApps = @(Get-DiscoveredAppsPage -Session $session -Skip $skip -Limit $pageLimit)
+    if ($useInitialDiscoveredPage) {
+        $pageApps = $initialDiscoveredApps
+        $useInitialDiscoveredPage = $false
+    } else {
+        $pageApps = @(Get-DiscoveredAppsPage -Session $session -Skip $skip -Limit $pageLimit)
+    }
+
     if ($pageApps.Count -eq 0) {
         break
     }
