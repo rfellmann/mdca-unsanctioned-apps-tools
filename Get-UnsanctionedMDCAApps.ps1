@@ -296,38 +296,29 @@ function Get-UnsanctionedBlockDomains {
     return $domains
 }
 
-# OPTIMIZATION: Retrieve all discovered apps (with paging)
-function Get-AllDiscoveredApps {
-    param([Microsoft.PowerShell.Commands.WebRequestSession]$Session)
-    
-    $skip = 0
-    $limit = 100
-    $allApps = @()
-    
-    while ($true) {
-        $body = @{
-            "filters" = @{}
-            "skip"    = $skip
-            "limit"   = $limit
-        }
-        
-        $response = Invoke-MDCAProxyApi -Endpoint "discovery/discovered_apps/" -Method "POST" -Body $body -Session $Session
-        
-        if ($response -and $response.data -and $response.data.Count -gt 0) {
-            $allApps += $response.data
-            
-            if ($response.data.Count -lt $limit) {
-                break
-            }
-            
-            $skip += $limit
-            Write-Host "." -NoNewline
-        } else {
-            break
-        }
+# Retrieve one discovered-app page so it can be processed and exported before fetching the next.
+function Get-DiscoveredAppsPage {
+    param(
+        [Microsoft.PowerShell.Commands.WebRequestSession]$Session,
+        [int]$Skip,
+        [int]$Limit = 250
+    )
+
+    $body = @{
+        "filters" = @{}
+        "skip"    = $Skip
+        "limit"   = $Limit
     }
-    
-    return $allApps
+
+    $response = Invoke-MDCAProxyApi -Endpoint "discovery/discovered_apps/" -Method "POST" -Body $body -Session $Session
+    if ($null -eq $response) {
+        throw "Failed to retrieve discovered apps at offset $Skip; stopping to avoid an incomplete export."
+    }
+    if ($response.PSObject.Properties.Name -notcontains 'data') {
+        throw "The discovered-app response at offset $Skip did not contain a data field."
+    }
+
+    return @($response.data)
 }
 
 function Get-AllAppCatalogApps {
@@ -398,61 +389,20 @@ function Get-AppCatalogAppByDomain {
     return $app
 }
 
-# OPTIMIZATION: Pre-load all apps into memory
-function Load-AllAppsToCache {
-    param([Microsoft.PowerShell.Commands.WebRequestSession]$Session)
-    
-    Write-Log "Pre-loading app cache..."
-    $allApps = Get-AllDiscoveredApps -Session $Session
-    $script:AllApps = $allApps
-    
-    # Build lookup hashtable for fast access
-    foreach ($app in $allApps) {
-        if ($app.name -and -not [string]::IsNullOrWhiteSpace($app.name)) {
-            # Store exact match
-            if (-not $script:AppCache.ContainsKey($app.name)) {
-                $script:AppCache[$app.name] = $app.appId
-            }
-            
-            # Store lowercase match
-            $lowerName = $app.name.ToLower()
-            if (-not $script:AppCache.ContainsKey($lowerName)) {
-                $script:AppCache[$lowerName] = $app.appId
-            }
-        }
-    }
-    
-    $script:AppCacheLoaded = $true
-    Write-Log "Loaded $($allApps.Count) apps into cache" -Level "SUCCESS"
-    return $allApps.Count
-}
-
-# Function to return all unsanctioned (banned) apps in the tenant
+# Match one discovered-app page against the global block list.
 function Get-UnsanctionedApps {
-    param([Microsoft.PowerShell.Commands.WebRequestSession]$Session)
-    
-    $blockDomains = @(Get-UnsanctionedBlockDomains -Session $Session | ForEach-Object { $_.ToLowerInvariant() } | Sort-Object -Unique)
-    $blockDomainLookup = @{}
-    foreach ($domain in $blockDomains) {
-        $blockDomainLookup[$domain] = $true
-    }
-    
-    # Reuse the cached apps if already loaded, otherwise fetch them
-    if ($script:AllApps -and $script:AllApps.Count -gt 0) {
-        $allApps = $script:AllApps
-    } else {
-        Write-Log "Retrieving all discovered apps..."
-        $allApps = Get-AllDiscoveredApps -Session $Session
-        $script:AllApps = $allApps
-    }
-    
+    param(
+        [object[]]$Apps,
+        [string[]]$BlockDomains,
+        [hashtable]$MatchedDomains,
+        [hashtable]$MatchedAppIds
+    )
+
     $unsanctioned = @()
-    $matchedDomains = @{}
-    $matchedAppIds = @{}
-    
-    foreach ($app in $allApps) {
+
+    foreach ($app in $Apps) {
         $appDomains = @(Get-AppDomains -App $app | ForEach-Object { $_.ToLowerInvariant() } | Sort-Object -Unique)
-        $matchedAppDomains = @($blockDomains | Where-Object {
+        $matchedAppDomains = @($BlockDomains | Where-Object {
             $blockDomain = $_
             @($appDomains | Where-Object {
                 $appDomain = $_
@@ -462,14 +412,14 @@ function Get-UnsanctionedApps {
         
         if ($app.banned -eq $true -or $matchedAppDomains.Count -gt 0) {
             foreach ($domain in $matchedAppDomains) {
-                $matchedDomains[$domain.ToLowerInvariant()] = $true
+                $MatchedDomains[$domain.ToLowerInvariant()] = $true
             }
             
             $appKey = if ($app.appId) { "appId:$($app.appId)" } else { "name:$($app.name)" }
-            if ($matchedAppIds.ContainsKey($appKey)) {
+            if ($MatchedAppIds.ContainsKey($appKey)) {
                 continue
             }
-            $matchedAppIds[$appKey] = $true
+            $MatchedAppIds[$appKey] = $true
             
             $displayDomains = if ($matchedAppDomains.Count -gt 0) { $matchedAppDomains } else { $appDomains }
             $unsanctioned += [pscustomobject]@{
@@ -482,9 +432,23 @@ function Get-UnsanctionedApps {
             }
         }
     }
-    
+
+    return $unsanctioned
+}
+
+# Resolve block-list domains that did not match any discovered-app page.
+function Get-UnmatchedBlockDomainApps {
+    param(
+        [string[]]$BlockDomains,
+        [hashtable]$MatchedDomains,
+        [hashtable]$MatchedAppIds,
+        [Microsoft.PowerShell.Commands.WebRequestSession]$Session
+    )
+
+    $unsanctioned = @()
     $catalogMatchesByAppId = @{}
-    foreach ($domain in @($blockDomains | Where-Object { -not $matchedDomains.ContainsKey($_) })) {
+
+    foreach ($domain in @($BlockDomains | Where-Object { -not $MatchedDomains.ContainsKey($_) })) {
         $catalogApp = Get-AppCatalogAppByDomain -Domain $domain -Session $Session
         if ($catalogApp -and $catalogApp.appId) {
             $catalogAppKey = "appId:$($catalogApp.appId)"
@@ -496,15 +460,15 @@ function Get-UnsanctionedApps {
             }
             
             $catalogMatchesByAppId[$catalogAppKey].Domains.Add($domain)
-            $matchedDomains[$domain] = $true
+            $MatchedDomains[$domain] = $true
         }
     }
     
     foreach ($catalogAppKey in $catalogMatchesByAppId.Keys) {
-        if ($matchedAppIds.ContainsKey($catalogAppKey)) {
+        if ($MatchedAppIds.ContainsKey($catalogAppKey)) {
             continue
         }
-        $matchedAppIds[$catalogAppKey] = $true
+        $MatchedAppIds[$catalogAppKey] = $true
         
         $catalogMatch = $catalogMatchesByAppId[$catalogAppKey]
         $domains = @($catalogMatch.Domains | Sort-Object -Unique)
@@ -518,8 +482,8 @@ function Get-UnsanctionedApps {
         }
     }
     
-    $unmatchedDomainGroups = @($blockDomains |
-        Where-Object { -not $matchedDomains.ContainsKey($_) } |
+    $unmatchedDomainGroups = @($BlockDomains |
+        Where-Object { -not $MatchedDomains.ContainsKey($_) } |
         Group-Object { Get-DomainGroupKey -Domain $_ })
     
     foreach ($group in $unmatchedDomainGroups) {
@@ -536,7 +500,6 @@ function Get-UnsanctionedApps {
         }
     }
     
-    Write-Log "Found $($unsanctioned.Count) unsanctioned (banned) app/domain groups in the tenant from $($blockDomains.Count) blocked domains" -Level "SUCCESS"
     return $unsanctioned
 }
 
@@ -561,6 +524,7 @@ function Get-RecordFieldValue {
 function Format-ExcelReadyRows {
     param(
         [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
         [System.Collections.IEnumerable]$Records,
         [string]$Delimiter = "`t"
     )
@@ -599,6 +563,7 @@ function Format-ExcelReadyRows {
 function Export-ExcelFriendlyFile {
     param(
         [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
         [System.Collections.IEnumerable]$Records,
         [Parameter(Mandatory = $true)]
         [string]$BasePath,
@@ -693,55 +658,83 @@ if ($null -eq $testResponse) {
 }
 Write-Log "API Connection Successful!" -Level "SUCCESS"
 
-# Retrieve all unsanctioned (banned) apps
-$unsanctionedApps = @(Get-UnsanctionedApps -Session $session)
+# Process and export each 250-app page before requesting the next one.
+$blockDomains = @(Get-UnsanctionedBlockDomains -Session $session | ForEach-Object { $_.ToLowerInvariant() } | Sort-Object -Unique)
+$matchedDomains = @{}
+$matchedAppIds = @{}
+$unsanctionedApps = @()
+$discoveredAppsProcessed = 0
+$batchLimit = 250
+$batchNumber = 0
+$runId = Get-Date -Format 'yyyyMMdd_HHmmss'
+$skip = 0
+
+while ($true) {
+    $batchApps = @(Get-DiscoveredAppsPage -Session $session -Skip $skip -Limit $batchLimit)
+    if ($batchApps.Count -eq 0) {
+        break
+    }
+
+    $batchNumber++
+    $discoveredAppsProcessed += $batchApps.Count
+    $batchUnsanctionedApps = @(Get-UnsanctionedApps -Apps $batchApps -BlockDomains $blockDomains -MatchedDomains $matchedDomains -MatchedAppIds $matchedAppIds)
+    $unsanctionedApps += $batchUnsanctionedApps
+
+    $batchBasePath = Join-Path -Path $PSScriptRoot -ChildPath ("MDCA_UnsanctionedApps_{0}_batch_{1:D3}" -f $runId, $batchNumber)
+    $batchCsv = Export-ExcelFriendlyFile -Records $batchUnsanctionedApps -BasePath $batchBasePath -Format CSV
+    $batchTsv = Export-ExcelFriendlyFile -Records $batchUnsanctionedApps -BasePath $batchBasePath -Format TSV
+    Write-Log "Processed discovered apps $($skip + 1)-$($skip + $batchApps.Count): $($batchApps.Count) records; $($batchUnsanctionedApps.Count) unsanctioned groups." -Level "SUCCESS"
+    Write-Host "Batch CSV saved to: $batchCsv" -ForegroundColor Yellow
+    Write-Host "Batch TSV saved to: $batchTsv" -ForegroundColor Yellow
+
+    if ($batchUnsanctionedApps.Count -gt 0) {
+        $tsvText = (Format-ExcelReadyRows -Records $batchUnsanctionedApps) -join "`r`n"
+        try {
+            $tsvText | Set-Clipboard
+            Write-Host "Batch $batchNumber copied to the clipboard." -ForegroundColor Green
+        }
+        catch {
+            Write-Log "Unable to copy batch $batchNumber to the clipboard: $($_.Exception.Message)" -Level "WARNING"
+        }
+    }
+
+    foreach ($app in $batchUnsanctionedApps) {
+        Write-Log "Unsanctioned: $($app.name) (ID: $($app.appId); DomainCount: $($app.DomainCount); Domains: $($app.Domains); Source: $($app.UnsanctionedSource))"
+    }
+
+    if ($batchApps.Count -lt $batchLimit) {
+        break
+    }
+    $skip += $batchLimit
+}
+
+# Resolve domains that were not matched to a discovered app and export them once.
+$remainingBlockListApps = @(Get-UnmatchedBlockDomainApps -BlockDomains $blockDomains -MatchedDomains $matchedDomains -MatchedAppIds $matchedAppIds -Session $session)
+$unsanctionedApps += $remainingBlockListApps
+$remainingBasePath = Join-Path -Path $PSScriptRoot -ChildPath "MDCA_UnsanctionedApps_${runId}_remaining_blocklist"
+$remainingCsv = Export-ExcelFriendlyFile -Records $remainingBlockListApps -BasePath $remainingBasePath -Format CSV
+$remainingTsv = Export-ExcelFriendlyFile -Records $remainingBlockListApps -BasePath $remainingBasePath -Format TSV
+Write-Host "Remaining block-list CSV saved to: $remainingCsv" -ForegroundColor Yellow
+Write-Host "Remaining block-list TSV saved to: $remainingTsv" -ForegroundColor Yellow
+
+foreach ($app in $remainingBlockListApps) {
+    Write-Log "Unsanctioned: $($app.name) (ID: $($app.appId); DomainCount: $($app.DomainCount); Domains: $($app.Domains); Source: $($app.UnsanctionedSource))"
+}
 
 $endTime = Get-Date
 $duration = $endTime - $startTime
-
-# Output results
-if ($unsanctionedApps.Count -gt 0) {
-    $excelRows = Format-ExcelReadyRows -Records ($unsanctionedApps |
-        Sort-Object name |
-        Select-Object @{Name='AppNameOrDomainGroup';Expression={$_.name}}, @{Name='AppId';Expression={$_.appId}}, @{Name='DomainCount';Expression={$_.DomainCount}}, @{Name='Domains';Expression={$_.Domains}}, @{Name='Source';Expression={$_.UnsanctionedSource}})
-
-    Write-Host "`nCopy/paste the following rows into Excel (tab-separated):" -ForegroundColor Cyan
-    $tsvText = $excelRows -join "`r`n"
-    Write-Output $tsvText
-
-    # Also copy to the clipboard for a one-click paste into Excel
-    try {
-        $tsvText | Set-Clipboard
-        Write-Host "`nExcel-ready data copied to the clipboard." -ForegroundColor Green
-    }
-    catch {
-        Write-Log "Unable to copy data to the clipboard: $($_.Exception.Message)" -Level "WARNING"
-    }
-
-    $baseName = "MDCA_UnsanctionedApps_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
-    $csvFile = Join-Path -Path $PSScriptRoot -ChildPath $baseName
-    $tsvFile = Export-ExcelFriendlyFile -Records ($unsanctionedApps | Sort-Object name | Select-Object @{Name='AppNameOrDomainGroup';Expression={$_.name}}, @{Name='AppId';Expression={$_.appId}}, @{Name='DomainCount';Expression={$_.DomainCount}}, @{Name='Domains';Expression={$_.Domains}}, @{Name='Source';Expression={$_.UnsanctionedSource}}) -BasePath $csvFile -Format TSV
-    $csvExport = Export-ExcelFriendlyFile -Records ($unsanctionedApps | Sort-Object name | Select-Object @{Name='AppNameOrDomainGroup';Expression={$_.name}}, @{Name='AppId';Expression={$_.appId}}, @{Name='DomainCount';Expression={$_.DomainCount}}, @{Name='Domains';Expression={$_.Domains}}, @{Name='Source';Expression={$_.UnsanctionedSource}}) -BasePath $csvFile -Format CSV
-
-    Write-Host "TSV saved to: $tsvFile" -ForegroundColor Yellow
-    Write-Host "CSV saved to: $csvExport" -ForegroundColor Yellow
-
-    foreach ($app in $unsanctionedApps) {
-        Write-Log "Unsanctioned: $($app.name) (ID: $($app.appId); DomainCount: $($app.DomainCount); Domains: $($app.Domains); Source: $($app.UnsanctionedSource))"
-    }
-} else {
+Write-Log "Discovered apps processed: $discoveredAppsProcessed" -Level "SUCCESS"
+Write-Log "Unsanctioned app/domain groups found: $($unsanctionedApps.Count)" -Level "SUCCESS"
+if ($unsanctionedApps.Count -eq 0) {
     Write-Log "No unsanctioned (banned) apps found in the tenant." -Level "WARNING"
 }
 
 # Summary
 Write-Host "`n" -NoNewline
 Write-Log "`n===== Complete ====="
-Write-Log "Unsanctioned (banned) app/domain groups found: $($unsanctionedApps.Count)" -Level "SUCCESS"
 Write-Log "Duration: $($duration.TotalSeconds) seconds"
 Write-Log "Log file saved to: $LogFile"
 
 # Return the apps so the caller/pipeline can use them
 $unsanctionedApps
-
-Write-Log "`n===== CSV saved to $($csvfile).csv  ====="
 
