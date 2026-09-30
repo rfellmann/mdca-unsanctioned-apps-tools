@@ -91,7 +91,7 @@ function Invoke-MDCAProxyApi {
             Headers          = $headers
             Body             = $jsonBody
             UseBasicParsing  = $true
-            TimeoutSec       = 30
+            TimeoutSec       = 120
             ErrorAction      = "Stop"
         }
         
@@ -143,7 +143,7 @@ function Invoke-MDCAProxyTextApi {
                 WebSession       = $Session
                 Headers          = $headers
                 UseBasicParsing  = $true
-                TimeoutSec       = 30
+                TimeoutSec       = 120
                 ErrorAction      = "Stop"
             }
             
