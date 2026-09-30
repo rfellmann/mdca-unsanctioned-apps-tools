@@ -1,10 +1,9 @@
-# Get-SanctionedMDCAApps.ps1
+# Get-UnsanctionedMDCAApps.ps1
 #
 # Capabilities:
 # - Connects to Microsoft Defender for Cloud Apps through security.microsoft.com cookie authentication.
-# - Retrieves unsanctioned/banned cloud app entries, including domains from discovery block scripts.
-# - Resolves discovered domains against the Cloud App Catalog where possible to include app names and app IDs.
-# - Groups domains into Excel-friendly app/domain rows and exports CSV/TSV output for review.
+# - Retrieves unsanctioned/banned cloud app entries and resolves domains against the Cloud App Catalog where possible.
+# - Groups domains into Excel-friendly rows and exports CSV/TSV output for review.
 #
 # Safety:
 # - Read-only: this script does not sanction, unsanction, delete, or modify any apps.
@@ -670,7 +669,6 @@ if ($null -eq $testResponse) {
     Write-Log "Debugging info:" -Level "ERROR"
     Write-Log "  - Tenant ID: $tenantId" -Level "ERROR"
     Write-Log "  - XSRF Token length: $($xsrfToken.Length)" -Level "ERROR"
-    Write-Log "  - XSRF Token starts with: $($xsrfToken.Substring(0, [Math]::Min(50, $xsrfToken.Length)))" -Level "ERROR"
     Write-Log "  - Cookies in session: $($session.Cookies.Count)" -Level "ERROR"
     Write-Log "" -Level "ERROR"
     Write-Log "IMPORTANT: Make sure you:" -Level "ERROR"
