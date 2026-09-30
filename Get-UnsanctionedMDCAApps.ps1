@@ -81,29 +81,42 @@ function Invoke-MDCAProxyApi {
     
     $uri = "https://security.microsoft.com/apiproxy/mcas/cas/api/v1/$Endpoint"
     
-    try {
-        $jsonBody = if ($Body) { $Body | ConvertTo-Json -Depth 10 -Compress } else { '{}' }
-        
-        $params = @{
-            Uri              = $uri
-            Method           = $Method
-            WebSession       = $Session
-            Headers          = $headers
-            Body             = $jsonBody
-            UseBasicParsing  = $true
-            TimeoutSec       = 120
-            ErrorAction      = "Stop"
-        }
-        
-        return Invoke-RestMethod @params
+    $jsonBody = if ($Body) { $Body | ConvertTo-Json -Depth 10 -Compress } else { '{}' }
+    $params = @{
+        Uri              = $uri
+        Method           = $Method
+        WebSession       = $Session
+        Headers          = $headers
+        Body             = $jsonBody
+        UseBasicParsing  = $true
+        TimeoutSec       = 120
+        ErrorAction      = "Stop"
     }
-    catch {
-        $errorMsg = $_.Exception.Message
-        if ($_.Exception.Response) {
-            $errorMsg += " - $($_.Exception.Response.StatusCode)"
+
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            return Invoke-RestMethod @params
         }
-        Write-Log "API call failed for $Endpoint : $errorMsg" -Level "ERROR"
-        return $null
+        catch {
+            $errorMsg = $_.Exception.Message
+            $statusCode = 0
+            if ($_.Exception.Response) {
+                $statusCode = [int]$_.Exception.Response.StatusCode
+                $errorMsg += " - $($_.Exception.Response.StatusCode)"
+            }
+
+            $transientStatus = $statusCode -in @(408, 429, 500, 502, 503, 504)
+            $transientTransport = $errorMsg -match '(?i)forcibly closed|transport connection|connection reset|timed? out|request was canceled|temporarily unavailable'
+            if (($transientStatus -or $transientTransport) -and $attempt -lt 3) {
+                $delaySeconds = 2 * $attempt
+                Write-Log "Transient API failure for $Endpoint; retrying in $delaySeconds seconds (attempt $($attempt + 1) of 3)." -Level "WARNING"
+                Start-Sleep -Seconds $delaySeconds
+                continue
+            }
+
+            Write-Log "API call failed for $Endpoint : $errorMsg" -Level "ERROR"
+            return $null
+        }
     }
 }
 
@@ -288,7 +301,7 @@ function Get-AllDiscoveredApps {
     param([Microsoft.PowerShell.Commands.WebRequestSession]$Session)
     
     $skip = 0
-    $limit = 500  # Increased batch size
+    $limit = 100
     $allApps = @()
     
     while ($true) {
