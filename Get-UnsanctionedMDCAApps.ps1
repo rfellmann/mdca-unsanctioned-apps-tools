@@ -423,7 +423,11 @@ function Get-UnmatchedBlockDomainApps {
 
     if ($remainingDomains.Count -gt 0) {
         Write-Log "Resolving $($remainingDomains.Count) unmatched blocked domains against the Cloud App Catalog..."
+        $domainIndex = 0
         foreach ($domain in $remainingDomains) {
+            $domainIndex++
+            $percentComplete = [int](100 * $domainIndex / $remainingDomains.Count)
+            Write-Progress -Id 2 -Activity "Resolving blocked domains" -Status "$domainIndex of $($remainingDomains.Count) checked" -PercentComplete $percentComplete
             $catalogApp = Get-AppCatalogAppByDomain -Domain $domain -Session $Session
             if (-not $catalogApp.appId) {
                 continue
@@ -440,6 +444,7 @@ function Get-UnmatchedBlockDomainApps {
             $catalogMatchesByAppId[$catalogAppKey].Domains.Add($domain)
             $MatchedDomains[$domain] = $true
         }
+        Write-Progress -Id 2 -Activity "Resolving blocked domains" -Completed
     }
     
     foreach ($catalogAppKey in $catalogMatchesByAppId.Keys) {
@@ -686,6 +691,7 @@ $session.Cookies.Add($cookie2)
 # Test API connection
 Write-Log "Testing API connection..."
 $testBody = @{ "filters" = @{}; "skip" = 0; "limit" = 250 }
+Write-Progress -Id 1 -Activity "Scanning discovered apps" -Status "Requesting the first page (up to 250 apps)"
 $testResponse = Invoke-MDCAProxyApi -Endpoint "discovery/discovered_apps/" -Method "POST" -Body $testBody -Session $session
 
 if ($null -eq $testResponse) {
@@ -726,6 +732,7 @@ while ($true) {
         $pageApps = $initialDiscoveredApps
         $useInitialDiscoveredPage = $false
     } else {
+        Write-Progress -Id 1 -Activity "Scanning discovered apps" -Status "Requesting apps $($skip + 1)-$($skip + $pageLimit)"
         $pageApps = @(Get-DiscoveredAppsPage -Session $session -Skip $skip -Limit $pageLimit)
     }
 
@@ -741,6 +748,7 @@ while ($true) {
     }
 
     Write-Log "Processed discovered apps $($skip + 1)-$($skip + $pageApps.Count): $($pageApps.Count) records; $($pageUnsanctionedApps.Count) unsanctioned groups." -Level "SUCCESS"
+    Write-Progress -Id 1 -Activity "Scanning discovered apps" -Status "Processed $discoveredAppsProcessed discovered apps; $($unsanctionedApps.Count) unsanctioned results found"
 
     $exportBatchNumber = Export-ReadyUnsanctionedBatches -PendingRecords $pendingUnsanctionedApps -BatchSize $exportBatchSize -NextBatchNumber $exportBatchNumber -RunId $runId -OutputDirectory $PSScriptRoot
 
@@ -749,6 +757,7 @@ while ($true) {
     }
     $skip += $pageLimit
 }
+Write-Progress -Id 1 -Activity "Scanning discovered apps" -Completed
 
 # Resolve remaining blocked domains, then flush full and final partial result batches.
 $remainingBlockListApps = @(Get-UnmatchedBlockDomainApps -BlockDomains $blockDomains -MatchedDomains $matchedDomains -MatchedAppIds $matchedAppIds -Session $session)
