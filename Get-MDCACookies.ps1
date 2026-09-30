@@ -2,7 +2,7 @@
 Get-MDCACookies.ps1
 
 Capabilities:
-- Opens security.microsoft.com in a dedicated Microsoft Edge session with local DevTools enabled.
+- Opens security.microsoft.com in a dedicated InPrivate Microsoft Edge session with local DevTools enabled.
 - Extracts the security portal sccauth and XSRF-TOKEN cookies from that signed-in browser session.
 - Displays separate copy buttons for each cookie so the values can be pasted into Get-SanctionedMDCAApps.ps1.
 - Avoids external SQLite dependencies by using the browser DevTools protocol.
@@ -60,6 +60,7 @@ function Start-SecurityPortalBrowser {
     $arguments = @(
         "--remote-debugging-port=$script:DevToolsPort",
         "--user-data-dir=$script:DevToolsUserDataDir",
+        "--inprivate",
         "--no-first-run",
         "--new-window",
         "https://security.microsoft.com"
@@ -148,14 +149,10 @@ function Get-BrowserCookiesForSecurityPortal {
     $parsed = @{}
     $requiredNames = @('sccauth', 'XSRF-TOKEN')
 
-    foreach ($cookie in ($result.cookies | Where-Object { $requiredNames -contains $_.name -and $_.domain -like '*security.microsoft.com*' })) {
+    foreach ($cookie in ($result.cookies | Where-Object {
+        $requiredNames -contains $_.name -and $_.domain -match '(^|\.)security\.microsoft\.com$'
+    })) {
         $parsed[$cookie.name] = $cookie.value
-    }
-
-    foreach ($cookie in ($result.cookies | Where-Object { $requiredNames -contains $_.name })) {
-        if (-not $parsed.ContainsKey($cookie.name)) {
-            $parsed[$cookie.name] = $cookie.value
-        }
     }
 
     return $parsed
