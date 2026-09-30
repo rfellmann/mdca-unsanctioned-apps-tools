@@ -26,9 +26,6 @@ $xsrfToken = ""
 # Your Tenant ID
 $tenantId = ""
 
-# Log file 
-$LogFile = "$PSScriptRoot\MDCA_UnsanctionedApps_Log_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
-
 # OPTIMIZATION: Cache for app lookups
 $script:AppCache = @{}
 $script:AppCacheLoaded = $false
@@ -41,7 +38,6 @@ function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $logMessage = "[$timestamp] [$Level] $Message"
-    Add-Content -Path $LogFile -Value $logMessage
     
     switch ($Level) {
         "ERROR"   { Write-Host $logMessage -ForegroundColor Red }
@@ -552,19 +548,11 @@ function Export-ExcelFriendlyFile {
         [AllowEmptyCollection()]
         [System.Collections.IEnumerable]$Records,
         [Parameter(Mandatory = $true)]
-        [string]$BasePath,
-        [ValidateSet('CSV','TSV')]
-        [string]$Format = 'CSV'
+        [string]$BasePath
     )
 
-    $delimiter = if ($Format -eq 'CSV') { ',' } else { "`t" }
-    $filePath = if ($Format -eq 'CSV') { "$BasePath.csv" } else { "$BasePath.tsv" }
-
-    if ($Format -eq 'CSV') {
-        $rows = @(ConvertTo-ExcelReadyRecords -Records $Records | ConvertTo-Csv -NoTypeInformation)
-    } else {
-        $rows = Format-ExcelReadyRows -Records $Records -Delimiter $delimiter
-    }
+    $filePath = "$BasePath.csv"
+    $rows = @(ConvertTo-ExcelReadyRecords -Records $Records | ConvertTo-Csv -NoTypeInformation)
     $rows -join "`r`n" | Set-Content -Path $filePath -Encoding UTF8
     return $filePath
 }
@@ -582,15 +570,13 @@ function Export-UnsanctionedAppsBatch {
     )
 
     $basePath = Join-Path -Path $OutputDirectory -ChildPath ("MDCA_UnsanctionedApps_{0}_batch_{1:D3}" -f $RunId, $BatchNumber)
-    $csvFile = Export-ExcelFriendlyFile -Records $Records -BasePath $basePath -Format CSV
-    $tsvFile = Export-ExcelFriendlyFile -Records $Records -BasePath $basePath -Format TSV
+    $csvFile = Export-ExcelFriendlyFile -Records $Records -BasePath $basePath
     Write-Host "Exported $($Records.Count) unsanctioned apps." -ForegroundColor Green
     Write-Host "CSV saved to: $csvFile" -ForegroundColor Yellow
-    Write-Host "TSV saved to: $tsvFile" -ForegroundColor Yellow
 
-    $tsvText = (Format-ExcelReadyRows -Records $Records) -join "`r`n"
+    $clipboardText = (Format-ExcelReadyRows -Records $Records) -join "`r`n"
     try {
-        $tsvText | Set-Clipboard
+        $clipboardText | Set-Clipboard
         Write-Host "Batch $BatchNumber copied to the clipboard." -ForegroundColor Green
     }
     catch {
@@ -780,7 +766,6 @@ if ($unsanctionedApps.Count -eq 0) {
 Write-Host "`n" -NoNewline
 Write-Log "`n===== Complete ====="
 Write-Log "Duration: $($duration.TotalSeconds) seconds"
-Write-Log "Log file saved to: $LogFile"
 
 # Return the apps so the caller/pipeline can use them
 $unsanctionedApps
