@@ -325,42 +325,40 @@ function Get-DiscoveredAppsPage {
     return @($response.data)
 }
 
-function Get-AllAppCatalogApps {
-    param([Microsoft.PowerShell.Commands.WebRequestSession]$Session)
-    
-    $skip = 0
-    $limit = 100
-    $allCatalogApps = @()
-    
-    while ($true) {
-        $body = @{
-            "filters" = @{}
-            "skip"    = $skip
-            "limit"   = $limit
-        }
-        
-        $response = Invoke-MDCAProxyApi -Endpoint "discovery/app_catalog/" -Method "POST" -Body $body -Session $Session
-        
-        if ($null -eq $response) {
-            throw "Failed to retrieve the Cloud App Catalog at offset $skip; stopping to avoid incomplete domain matching."
-        }
-        if ($response.PSObject.Properties.Name -notcontains 'data') {
-            throw "The Cloud App Catalog response at offset $skip did not contain a data field."
-        }
-        if ($response.data.Count -eq 0) {
-            break
-        }
+function Get-AppCatalogAppByDomain {
+    param(
+        [string]$Domain,
+        [Microsoft.PowerShell.Commands.WebRequestSession]$Session
+    )
 
-        $allCatalogApps += $response.data
-        if ($response.data.Count -lt $limit) {
-            break
-        }
-
-        $skip += $limit
-        Write-Host "." -NoNewline
+    if ([string]::IsNullOrWhiteSpace($Domain)) {
+        return $null
     }
-    
-    return $allCatalogApps
+
+    $normalizedDomain = $Domain.ToLowerInvariant().Trim()
+    $body = @{
+        "filters" = @{
+            "domainList" = @{
+                "eq" = $normalizedDomain
+            }
+        }
+        "skip"  = 0
+        "limit" = 1
+    }
+
+    $response = Invoke-MDCAProxyApi -Endpoint "discovery/app_catalog/" -Method "POST" -Body $body -Session $Session
+    if ($null -eq $response) {
+        throw "Cloud App Catalog lookup failed for a blocked domain; see the API error above."
+    }
+    if ($response.PSObject.Properties.Name -notcontains 'data') {
+        throw "The Cloud App Catalog lookup response did not contain a data field."
+    }
+
+    if ($response.data.Count -gt 0) {
+        return @($response.data)[0]
+    }
+
+    return $null
 }
 
 # Match one discovered-app page against the global block list.
@@ -424,30 +422,9 @@ function Get-UnmatchedBlockDomainApps {
     $catalogMatchesByAppId = @{}
 
     if ($remainingDomains.Count -gt 0) {
-        Write-Log "Loading the Cloud App Catalog once to resolve $($remainingDomains.Count) remaining blocked domains..."
-        $allCatalogApps = @(Get-AllAppCatalogApps -Session $Session)
-        $catalogAppsByDomain = @{}
-
-        foreach ($catalogApp in $allCatalogApps) {
-            $catalogDomains = @()
-            if ($catalogApp.PSObject.Properties.Name -contains 'domainList' -and $catalogApp.domainList) {
-                $catalogDomains = @(Get-DomainsFromValue -Value $catalogApp.domainList)
-            }
-
-            foreach ($catalogDomain in $catalogDomains) {
-                $normalizedCatalogDomain = $catalogDomain.ToLowerInvariant().Trim()
-                if (-not $catalogAppsByDomain.ContainsKey($normalizedCatalogDomain)) {
-                    $catalogAppsByDomain[$normalizedCatalogDomain] = $catalogApp
-                }
-            }
-        }
-
+        Write-Log "Resolving $($remainingDomains.Count) unmatched blocked domains against the Cloud App Catalog..."
         foreach ($domain in $remainingDomains) {
-            if (-not $catalogAppsByDomain.ContainsKey($domain)) {
-                continue
-            }
-
-            $catalogApp = $catalogAppsByDomain[$domain]
+            $catalogApp = Get-AppCatalogAppByDomain -Domain $domain -Session $Session
             if (-not $catalogApp.appId) {
                 continue
             }
