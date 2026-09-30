@@ -542,21 +542,6 @@ function Format-ExcelReadyRows {
     return $excelRows
 }
 
-function Export-ExcelFriendlyFile {
-    param(
-        [Parameter(Mandatory = $true)]
-        [AllowEmptyCollection()]
-        [System.Collections.IEnumerable]$Records,
-        [Parameter(Mandatory = $true)]
-        [string]$BasePath
-    )
-
-    $filePath = "$BasePath.csv"
-    $rows = @(ConvertTo-ExcelReadyRecords -Records $Records | ConvertTo-Csv -NoTypeInformation)
-    $rows -join "`r`n" | Set-Content -Path $filePath -Encoding UTF8
-    return $filePath
-}
-
 function Export-UnsanctionedAppsBatch {
     param(
         [Parameter(Mandatory = $true)]
@@ -569,10 +554,16 @@ function Export-UnsanctionedAppsBatch {
         [string]$OutputDirectory
     )
 
-    $basePath = Join-Path -Path $OutputDirectory -ChildPath ("MDCA_UnsanctionedApps_{0}_batch_{1:D3}" -f $RunId, $BatchNumber)
-    $csvFile = Export-ExcelFriendlyFile -Records $Records -BasePath $basePath
+    $csvFile = Join-Path -Path $OutputDirectory -ChildPath "MDCA_UnsanctionedApps_${RunId}.csv"
+    $excelRecords = @(ConvertTo-ExcelReadyRecords -Records $Records)
+    if ($BatchNumber -eq 1) {
+        $excelRecords | Export-Csv -LiteralPath $csvFile -NoTypeInformation -Encoding UTF8
+    } else {
+        $excelRecords | Export-Csv -LiteralPath $csvFile -NoTypeInformation -Encoding UTF8 -Append
+    }
+
     Write-Host "Exported $($Records.Count) unsanctioned apps." -ForegroundColor Green
-    Write-Host "CSV saved to: $csvFile" -ForegroundColor Yellow
+    Write-Host "Appended batch $BatchNumber to the consolidated CSV." -ForegroundColor Yellow
 
     $clipboardText = (Format-ExcelReadyRows -Records $Records) -join "`r`n"
     try {
@@ -709,7 +700,8 @@ $discoveredAppsProcessed = 0
 $pageLimit = 250
 $exportBatchSize = 250
 $exportBatchNumber = 1
-$runId = Get-Date -Format 'yyyyMMdd_HHmmss'
+$runId = Get-Date -Format 'yyyyMMdd_HHmmss_fff'
+$finalCsvPath = Join-Path -Path $PSScriptRoot -ChildPath "MDCA_UnsanctionedApps_${runId}.csv"
 $skip = 0
 $useInitialDiscoveredPage = $true
 
@@ -760,6 +752,8 @@ Write-Log "Discovered apps processed: $discoveredAppsProcessed" -Level "SUCCESS"
 Write-Log "Unsanctioned app/domain groups found: $($unsanctionedApps.Count)" -Level "SUCCESS"
 if ($unsanctionedApps.Count -eq 0) {
     Write-Log "No unsanctioned (banned) apps found in the tenant." -Level "WARNING"
+} else {
+    Write-Host "Consolidated CSV saved to: $finalCsvPath" -ForegroundColor Yellow
 }
 
 # Summary
