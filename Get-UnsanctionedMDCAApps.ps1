@@ -579,6 +579,67 @@ function Export-ExcelFriendlyFile {
     return $filePath
 }
 
+function Export-UnsanctionedAppsBatch {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$Records,
+        [Parameter(Mandatory = $true)]
+        [int]$BatchNumber,
+        [Parameter(Mandatory = $true)]
+        [string]$RunId,
+        [Parameter(Mandatory = $true)]
+        [string]$OutputDirectory
+    )
+
+    $basePath = Join-Path -Path $OutputDirectory -ChildPath ("MDCA_UnsanctionedApps_{0}_batch_{1:D3}" -f $RunId, $BatchNumber)
+    $csvFile = Export-ExcelFriendlyFile -Records $Records -BasePath $basePath -Format CSV
+    $tsvFile = Export-ExcelFriendlyFile -Records $Records -BasePath $basePath -Format TSV
+    Write-Host "Exported $($Records.Count) unsanctioned apps." -ForegroundColor Green
+    Write-Host "CSV saved to: $csvFile" -ForegroundColor Yellow
+    Write-Host "TSV saved to: $tsvFile" -ForegroundColor Yellow
+
+    $tsvText = (Format-ExcelReadyRows -Records $Records) -join "`r`n"
+    try {
+        $tsvText | Set-Clipboard
+        Write-Host "Batch $BatchNumber copied to the clipboard." -ForegroundColor Green
+    }
+    catch {
+        Write-Log "Unable to copy batch $BatchNumber to the clipboard: $($_.Exception.Message)" -Level "WARNING"
+    }
+
+    foreach ($app in $Records) {
+        Write-Log "Unsanctioned: $($app.name) (ID: $($app.appId); DomainCount: $($app.DomainCount); Domains: $($app.Domains); Source: $($app.UnsanctionedSource))"
+    }
+
+    return $BatchNumber + 1
+}
+
+function Export-ReadyUnsanctionedBatches {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [System.Collections.Generic.List[object]]$PendingRecords,
+        [Parameter(Mandatory = $true)]
+        [int]$BatchSize,
+        [Parameter(Mandatory = $true)]
+        [int]$NextBatchNumber,
+        [Parameter(Mandatory = $true)]
+        [string]$RunId,
+        [Parameter(Mandatory = $true)]
+        [string]$OutputDirectory,
+        [switch]$IncludeRemainder
+    )
+
+    while ($PendingRecords.Count -ge $BatchSize -or ($IncludeRemainder -and $PendingRecords.Count -gt 0)) {
+        $recordCount = [Math]::Min($BatchSize, $PendingRecords.Count)
+        $records = $PendingRecords.GetRange(0, $recordCount).ToArray()
+        $NextBatchNumber = Export-UnsanctionedAppsBatch -Records $records -BatchNumber $NextBatchNumber -RunId $RunId -OutputDirectory $OutputDirectory
+        $PendingRecords.RemoveRange(0, $recordCount)
+    }
+
+    return $NextBatchNumber
+}
+
 function Get-AppIdByName {
     param(
         [string]$AppName,
@@ -658,68 +719,50 @@ if ($null -eq $testResponse) {
 }
 Write-Log "API Connection Successful!" -Level "SUCCESS"
 
-# Process and export each 250-app page before requesting the next one.
+# Fetch discovered apps in pages, but create exports in batches of 250 unsanctioned results.
 $blockDomains = @(Get-UnsanctionedBlockDomains -Session $session | ForEach-Object { $_.ToLowerInvariant() } | Sort-Object -Unique)
 $matchedDomains = @{}
 $matchedAppIds = @{}
 $unsanctionedApps = @()
+$pendingUnsanctionedApps = [System.Collections.Generic.List[object]]::new()
 $discoveredAppsProcessed = 0
-$batchLimit = 250
-$batchNumber = 0
+$pageLimit = 250
+$exportBatchSize = 250
+$exportBatchNumber = 1
 $runId = Get-Date -Format 'yyyyMMdd_HHmmss'
 $skip = 0
 
 while ($true) {
-    $batchApps = @(Get-DiscoveredAppsPage -Session $session -Skip $skip -Limit $batchLimit)
-    if ($batchApps.Count -eq 0) {
+    $pageApps = @(Get-DiscoveredAppsPage -Session $session -Skip $skip -Limit $pageLimit)
+    if ($pageApps.Count -eq 0) {
         break
     }
 
-    $batchNumber++
-    $discoveredAppsProcessed += $batchApps.Count
-    $batchUnsanctionedApps = @(Get-UnsanctionedApps -Apps $batchApps -BlockDomains $blockDomains -MatchedDomains $matchedDomains -MatchedAppIds $matchedAppIds)
-    $unsanctionedApps += $batchUnsanctionedApps
-
-    $batchBasePath = Join-Path -Path $PSScriptRoot -ChildPath ("MDCA_UnsanctionedApps_{0}_batch_{1:D3}" -f $runId, $batchNumber)
-    $batchCsv = Export-ExcelFriendlyFile -Records $batchUnsanctionedApps -BasePath $batchBasePath -Format CSV
-    $batchTsv = Export-ExcelFriendlyFile -Records $batchUnsanctionedApps -BasePath $batchBasePath -Format TSV
-    Write-Log "Processed discovered apps $($skip + 1)-$($skip + $batchApps.Count): $($batchApps.Count) records; $($batchUnsanctionedApps.Count) unsanctioned groups." -Level "SUCCESS"
-    Write-Host "Batch CSV saved to: $batchCsv" -ForegroundColor Yellow
-    Write-Host "Batch TSV saved to: $batchTsv" -ForegroundColor Yellow
-
-    if ($batchUnsanctionedApps.Count -gt 0) {
-        $tsvText = (Format-ExcelReadyRows -Records $batchUnsanctionedApps) -join "`r`n"
-        try {
-            $tsvText | Set-Clipboard
-            Write-Host "Batch $batchNumber copied to the clipboard." -ForegroundColor Green
-        }
-        catch {
-            Write-Log "Unable to copy batch $batchNumber to the clipboard: $($_.Exception.Message)" -Level "WARNING"
-        }
+    $discoveredAppsProcessed += $pageApps.Count
+    $pageUnsanctionedApps = @(Get-UnsanctionedApps -Apps $pageApps -BlockDomains $blockDomains -MatchedDomains $matchedDomains -MatchedAppIds $matchedAppIds)
+    foreach ($app in $pageUnsanctionedApps) {
+        $pendingUnsanctionedApps.Add($app)
+        $unsanctionedApps += $app
     }
 
-    foreach ($app in $batchUnsanctionedApps) {
-        Write-Log "Unsanctioned: $($app.name) (ID: $($app.appId); DomainCount: $($app.DomainCount); Domains: $($app.Domains); Source: $($app.UnsanctionedSource))"
-    }
+    Write-Log "Processed discovered apps $($skip + 1)-$($skip + $pageApps.Count): $($pageApps.Count) records; $($pageUnsanctionedApps.Count) unsanctioned groups." -Level "SUCCESS"
 
-    if ($batchApps.Count -lt $batchLimit) {
+    $exportBatchNumber = Export-ReadyUnsanctionedBatches -PendingRecords $pendingUnsanctionedApps -BatchSize $exportBatchSize -NextBatchNumber $exportBatchNumber -RunId $runId -OutputDirectory $PSScriptRoot
+
+    if ($pageApps.Count -lt $pageLimit) {
         break
     }
-    $skip += $batchLimit
+    $skip += $pageLimit
 }
 
-# Resolve domains that were not matched to a discovered app and export them once.
+# Resolve remaining blocked domains, then flush full and final partial result batches.
 $remainingBlockListApps = @(Get-UnmatchedBlockDomainApps -BlockDomains $blockDomains -MatchedDomains $matchedDomains -MatchedAppIds $matchedAppIds -Session $session)
-$unsanctionedApps += $remainingBlockListApps
-$remainingBasePath = Join-Path -Path $PSScriptRoot -ChildPath "MDCA_UnsanctionedApps_${runId}_remaining_blocklist"
-$remainingCsv = Export-ExcelFriendlyFile -Records $remainingBlockListApps -BasePath $remainingBasePath -Format CSV
-$remainingTsv = Export-ExcelFriendlyFile -Records $remainingBlockListApps -BasePath $remainingBasePath -Format TSV
-Write-Host "Remaining block-list CSV saved to: $remainingCsv" -ForegroundColor Yellow
-Write-Host "Remaining block-list TSV saved to: $remainingTsv" -ForegroundColor Yellow
-
 foreach ($app in $remainingBlockListApps) {
-    Write-Log "Unsanctioned: $($app.name) (ID: $($app.appId); DomainCount: $($app.DomainCount); Domains: $($app.Domains); Source: $($app.UnsanctionedSource))"
+    $pendingUnsanctionedApps.Add($app)
+    $unsanctionedApps += $app
 }
+
+$exportBatchNumber = Export-ReadyUnsanctionedBatches -PendingRecords $pendingUnsanctionedApps -BatchSize $exportBatchSize -NextBatchNumber $exportBatchNumber -RunId $runId -OutputDirectory $PSScriptRoot -IncludeRemainder
 
 $endTime = Get-Date
 $duration = $endTime - $startTime
