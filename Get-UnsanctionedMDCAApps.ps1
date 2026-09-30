@@ -291,6 +291,10 @@ function Get-UnsanctionedBlockDomains {
     
     Write-Log "Retrieving global unsanctioned app block list..."
     $blockScript = Invoke-MDCAProxyTextApi -Endpoint "discovery_block_scripts/?format=102&type=banned" -Method "GET" -Session $Session -ApiBasePaths @("api", "api/v1")
+    if ($null -eq $blockScript) {
+        throw "Failed to retrieve the global unsanctioned app block list; see the API errors above."
+    }
+
     $domains = @(Convert-BlockScriptToDomains -BlockScript $blockScript)
     Write-Log "Found $($domains.Count) domains in the global unsanctioned app block list" -Level "SUCCESS"
     return $domains
@@ -325,7 +329,7 @@ function Get-AllAppCatalogApps {
     param([Microsoft.PowerShell.Commands.WebRequestSession]$Session)
     
     $skip = 0
-    $limit = 250
+    $limit = 100
     $allCatalogApps = @()
     
     while ($true) {
@@ -518,6 +522,24 @@ function Get-RecordFieldValue {
     return $null
 }
 
+function ConvertTo-ExcelReadyRecords {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [System.Collections.IEnumerable]$Records
+    )
+
+    foreach ($record in @($Records)) {
+        [pscustomobject][ordered]@{
+            AppNameOrDomainGroup = Get-RecordFieldValue -Record $record -Names @('AppNameOrDomainGroup','name')
+            AppId                = Get-RecordFieldValue -Record $record -Names @('AppId','appId')
+            Source               = Get-RecordFieldValue -Record $record -Names @('Source','UnsanctionedSource')
+            DomainCount          = Get-RecordFieldValue -Record $record -Names @('DomainCount')
+            Domains              = Get-RecordFieldValue -Record $record -Names @('Domains','domains')
+        }
+    }
+}
+
 function Format-ExcelReadyRows {
     param(
         [Parameter(Mandatory = $true)]
@@ -526,32 +548,17 @@ function Format-ExcelReadyRows {
         [string]$Delimiter = "`t"
     )
 
-    $excelRows = @(
-        ($(
-            "AppNameOrDomainGroup",
-            "AppId",
-            "Source",
-            "DomainCount",
-            "Domains"
+    $header = @("AppNameOrDomainGroup", "AppId", "Source", "DomainCount", "Domains") -join $Delimiter
+    $excelRows = @($header)
+
+    foreach ($record in (ConvertTo-ExcelReadyRecords -Records $Records)) {
+        $excelRows += (@(
+            $record.AppNameOrDomainGroup,
+            $record.AppId,
+            $record.Source,
+            $record.DomainCount,
+            $record.Domains
         ) -join $Delimiter)
-    )
-
-    foreach ($record in @($Records)) {
-        $nameValue = Get-RecordFieldValue -Record $record -Names @('AppNameOrDomainGroup','name')
-        $appIdValue = Get-RecordFieldValue -Record $record -Names @('AppId','appId')
-        $sourceValue = Get-RecordFieldValue -Record $record -Names @('Source','UnsanctionedSource')
-        $domainCountValue = Get-RecordFieldValue -Record $record -Names @('DomainCount')
-        $domainsValue = Get-RecordFieldValue -Record $record -Names @('Domains','domains')
-
-        $excelRows += @(
-            $(
-                $nameValue,
-                $appIdValue,
-                $sourceValue,
-                $domainCountValue,
-                $domainsValue
-            ) -join $Delimiter
-        )
     }
 
     return $excelRows
@@ -571,7 +578,11 @@ function Export-ExcelFriendlyFile {
     $delimiter = if ($Format -eq 'CSV') { ',' } else { "`t" }
     $filePath = if ($Format -eq 'CSV') { "$BasePath.csv" } else { "$BasePath.tsv" }
 
-    $rows = Format-ExcelReadyRows -Records $Records -Delimiter $delimiter
+    if ($Format -eq 'CSV') {
+        $rows = @(ConvertTo-ExcelReadyRecords -Records $Records | ConvertTo-Csv -NoTypeInformation)
+    } else {
+        $rows = Format-ExcelReadyRows -Records $Records -Delimiter $delimiter
+    }
     $rows -join "`r`n" | Set-Content -Path $filePath -Encoding UTF8
     return $filePath
 }
@@ -703,8 +714,6 @@ $testResponse = Invoke-MDCAProxyApi -Endpoint "discovery/discovered_apps/" -Meth
 if ($null -eq $testResponse) {
     Write-Log "API Connection Failed!" -Level "ERROR"
     Write-Log "Debugging info:" -Level "ERROR"
-    Write-Log "  - Tenant ID: $tenantId" -Level "ERROR"
-    Write-Log "  - XSRF Token length: $($xsrfToken.Length)" -Level "ERROR"
     Write-Log "  - Cookies in session: $($session.Cookies.Count)" -Level "ERROR"
     Write-Log "" -Level "ERROR"
     Write-Log "IMPORTANT: Make sure you:" -Level "ERROR"
