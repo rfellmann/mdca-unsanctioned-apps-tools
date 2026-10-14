@@ -10,6 +10,9 @@
 # - This is a custom script and is not an official Microsoft product; no support is provided by Microsoft.
 # - Do not commit real sccauth, XSRF-TOKEN, tenant, or customer-specific values.
 
+# Domain matching uses a suffix index; unmatched domains use bounded catalog workers.
+# Compatible with Windows PowerShell 5.1 and PowerShell 7 on Windows.
+
 # ====================================================================
 # CONFIGURATION - PASTE YOUR VALUES BELOW
 # ====================================================================
@@ -18,13 +21,16 @@
 # Get these from the same browser session where you are signed in to https://security.microsoft.com.
 
 # security.microsoft.com sccauth cookie value
-$sccauth = ""
+$sccauth = "INSERT_YOUR_SCCAUTH_COOKIE_HERE"
 
 # security.microsoft.com XSRF-TOKEN cookie value
-$xsrfToken = ""
+$xsrfToken = "INSERT_YOUR_XSRF_TOKEN_COOKIE_HERE"
 
 # Your Tenant ID
-$tenantId = ""
+$tenantId = "INSERT_YOUR_TENANT_ID_HERE"
+
+# Maximum simultaneous catalog requests. Reduce to 1 if the service throttles.
+$catalogLookupConcurrency = 4
 
 # OPTIMIZATION: Cache for app lookups
 $script:AppCache = @{}
@@ -105,6 +111,23 @@ function Invoke-MDCAProxyApi {
             $transientTransport = $errorMsg -match '(?i)forcibly closed|transport connection|connection reset|timed? out|request was canceled|temporarily unavailable'
             if (($transientStatus -or $transientTransport) -and $attempt -lt 3) {
                 $delaySeconds = 2 * $attempt
+                if ($_.Exception.Response) {
+                    $responseHeaders = $_.Exception.Response.Headers
+                    $retryAfter = $null
+                    if ($responseHeaders -is [System.Net.WebHeaderCollection]) {
+                        $retryAfter = $responseHeaders['Retry-After']
+                    } elseif ($responseHeaders.RetryAfter) {
+                        $retryAfter = $responseHeaders.RetryAfter.ToString()
+                    }
+
+                    $retrySeconds = 0
+                    $retryDate = [DateTimeOffset]::MinValue
+                    if ([int]::TryParse([string]$retryAfter, [ref]$retrySeconds)) {
+                        $delaySeconds = [Math]::Max($delaySeconds, $retrySeconds)
+                    } elseif ([DateTimeOffset]::TryParse([string]$retryAfter, [ref]$retryDate)) {
+                        $delaySeconds = [Math]::Max($delaySeconds, [int][Math]::Ceiling(($retryDate - [DateTimeOffset]::UtcNow).TotalSeconds))
+                    }
+                }
                 Write-Log "Transient API failure for $Endpoint; retrying in $delaySeconds seconds (attempt $($attempt + 1) of 3)." -Level "WARNING"
                 Start-Sleep -Seconds $delaySeconds
                 continue
@@ -357,26 +380,87 @@ function Get-AppCatalogAppByDomain {
     return $null
 }
 
-# Match one discovered-app page against the global block list.
+function New-BlockDomainIndex {
+    param(
+        [AllowEmptyCollection()]
+        [string[]]$BlockDomains
+    )
+
+    $index = @{
+        Exact       = @{}
+        Descendants = @{}
+    }
+
+    foreach ($domain in $BlockDomains) {
+        $normalizedDomain = $domain.ToLowerInvariant()
+        if ($index.Exact.ContainsKey($normalizedDomain)) {
+            continue
+        }
+        $index.Exact[$normalizedDomain] = $true
+        $suffix = $normalizedDomain
+
+        while ($true) {
+            if (-not $index.Descendants.ContainsKey($suffix)) {
+                $index.Descendants[$suffix] = [System.Collections.Generic.List[string]]::new()
+            }
+            $index.Descendants[$suffix].Add($normalizedDomain)
+
+            $dot = $suffix.IndexOf('.')
+            if ($dot -lt 0) {
+                break
+            }
+            $suffix = $suffix.Substring($dot + 1)
+        }
+    }
+
+    return $index
+}
+
+function Get-MatchingBlockDomains {
+    param(
+        [AllowEmptyCollection()]
+        [string[]]$AppDomains,
+        [hashtable]$BlockDomainIndex
+    )
+
+    $matches = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($domain in $AppDomains) {
+        $suffix = $domain.ToLowerInvariant()
+        if ($BlockDomainIndex.Descendants.ContainsKey($suffix)) {
+            foreach ($blockedDomain in $BlockDomainIndex.Descendants[$suffix]) {
+                $null = $matches.Add($blockedDomain)
+            }
+        }
+
+        while ($true) {
+            if ($BlockDomainIndex.Exact.ContainsKey($suffix)) {
+                $null = $matches.Add($suffix)
+            }
+            $dot = $suffix.IndexOf('.')
+            if ($dot -lt 0) {
+                break
+            }
+            $suffix = $suffix.Substring($dot + 1)
+        }
+    }
+
+    return @($matches | Sort-Object)
+}
+
+# Match one discovered-app page without scanning the block list for every app.
 function Get-UnsanctionedApps {
     param(
         [object[]]$Apps,
-        [string[]]$BlockDomains,
+        [hashtable]$BlockDomainIndex,
         [hashtable]$MatchedDomains,
         [hashtable]$MatchedAppIds
     )
 
-    $unsanctioned = @()
+    $unsanctioned = [System.Collections.Generic.List[object]]::new()
 
     foreach ($app in $Apps) {
-        $appDomains = @(Get-AppDomains -App $app | ForEach-Object { $_.ToLowerInvariant() } | Sort-Object -Unique)
-        $matchedAppDomains = @($BlockDomains | Where-Object {
-            $blockDomain = $_
-            @($appDomains | Where-Object {
-                $appDomain = $_
-                $blockDomain -eq $appDomain -or $blockDomain.EndsWith(".$appDomain") -or $appDomain.EndsWith(".$blockDomain")
-            }).Count -gt 0
-        } | Sort-Object -Unique)
+        $appDomains = @(Get-AppDomains -App $app)
+        $matchedAppDomains = @(Get-MatchingBlockDomains -AppDomains $appDomains -BlockDomainIndex $BlockDomainIndex)
         
         if ($app.banned -eq $true -or $matchedAppDomains.Count -gt 0) {
             foreach ($domain in $matchedAppDomains) {
@@ -390,18 +474,139 @@ function Get-UnsanctionedApps {
             $MatchedAppIds[$appKey] = $true
             
             $displayDomains = if ($matchedAppDomains.Count -gt 0) { $matchedAppDomains } else { $appDomains }
-            $unsanctioned += [pscustomobject]@{
+            $unsanctioned.Add([pscustomobject]@{
                 name                = $app.name
                 appId               = $app.appId
                 Domains             = ($displayDomains -join ", ")
                 DomainCount         = $displayDomains.Count
                 banned              = $true
                 UnsanctionedSource  = "DiscoveredApps"
-            }
+            })
         }
     }
 
-    return $unsanctioned
+    return $unsanctioned.ToArray()
+}
+
+function Get-CatalogAppsByDomain {
+    param(
+        [AllowEmptyCollection()]
+        [string[]]$Domains,
+        [Microsoft.PowerShell.Commands.WebRequestSession]$Session,
+        [ValidateRange(1, 8)]
+        [int]$Concurrency = 4
+    )
+
+    if ($Domains.Count -eq 0) {
+        return
+    }
+
+    $state = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+    foreach ($functionName in @('Invoke-MDCAProxyApi', 'Get-AppCatalogAppByDomain')) {
+        $definition = (Get-Item "Function:\$functionName").Definition
+        $state.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($functionName, $definition))
+    }
+    $state.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new('Write-Log', {
+        param([string]$Message, [string]$Level = 'INFO')
+        Write-Warning "[$Level] $Message"
+    }.ToString()))
+
+    $cookieDefinitions = @(
+        foreach ($cookie in $Session.Cookies.GetCookies([Uri]'https://security.microsoft.com')) {
+            [pscustomobject]@{
+                Name   = $cookie.Name
+                Value  = $cookie.Value
+                Path   = $cookie.Path
+                Domain = $cookie.Domain
+            }
+        }
+    )
+    foreach ($entry in @{
+        tenantId          = $tenantId
+        xsrfToken         = $xsrfToken
+        CatalogCookies    = $cookieDefinitions
+        CatalogUserAgent  = $Session.UserAgent
+    }.GetEnumerator()) {
+        $state.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new($entry.Key, $entry.Value, ''))
+    }
+
+    $worker = {
+        param([string]$Domain)
+        # Each runspace reuses its own session; cookie containers are not shared.
+        if (-not $script:CatalogSession) {
+            $script:CatalogSession = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+            $script:CatalogSession.UserAgent = $CatalogUserAgent
+            foreach ($cookie in $CatalogCookies) {
+                $script:CatalogSession.Cookies.Add([System.Net.Cookie]::new($cookie.Name, $cookie.Value, $cookie.Path, $cookie.Domain))
+            }
+        }
+        [pscustomobject]@{
+            Domain = $Domain
+            App    = Get-AppCatalogAppByDomain -Domain $Domain -Session $script:CatalogSession
+        }
+    }
+
+    $pool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $Concurrency, $state, $Host)
+    $jobs = [System.Collections.Generic.List[object]]::new()
+    $nextDomain = 0
+    $completed = 0
+
+    try {
+        $pool.Open()
+        while ($nextDomain -lt $Domains.Count -or $jobs.Count -gt 0) {
+            while ($nextDomain -lt $Domains.Count -and $jobs.Count -lt $Concurrency) {
+                $pipeline = [System.Management.Automation.PowerShell]::Create()
+                $pipeline.RunspacePool = $pool
+                $null = $pipeline.AddScript($worker.ToString()).AddArgument($Domains[$nextDomain])
+                try {
+                    $handle = $pipeline.BeginInvoke()
+                } catch {
+                    $pipeline.Dispose()
+                    throw
+                }
+                $jobs.Add([pscustomobject]@{
+                    Domain   = $Domains[$nextDomain]
+                    Pipeline = $pipeline
+                    Handle   = $handle
+                })
+                $nextDomain++
+            }
+
+            $readyJobs = @($jobs | Where-Object { $_.Handle.IsCompleted })
+            if ($readyJobs.Count -eq 0) {
+                $handles = [System.Threading.WaitHandle[]]@($jobs | ForEach-Object { $_.Handle.AsyncWaitHandle })
+                $null = [System.Threading.WaitHandle]::WaitAny($handles, 1000)
+                continue
+            }
+
+            foreach ($job in $readyJobs) {
+                try {
+                    $result = @($job.Pipeline.EndInvoke($job.Handle))
+                    if ($job.Pipeline.HadErrors -or $result.Count -ne 1) {
+                        throw "Catalog worker failed or returned an unexpected result."
+                    }
+                    $result[0]
+                } catch {
+                    throw "Cloud App Catalog lookup failed for $($job.Domain); stopping to avoid an incomplete export. $($_.Exception.Message)"
+                } finally {
+                    $job.Pipeline.Dispose()
+                    $null = $jobs.Remove($job)
+                }
+                $completed++
+                Write-Progress -Id 2 -Activity 'Resolving blocked domains' -Status "$completed of $($Domains.Count) checked ($Concurrency workers)" -PercentComplete ([int](100 * $completed / $Domains.Count))
+            }
+        }
+    } finally {
+        foreach ($job in $jobs) {
+            try {
+                $job.Pipeline.Stop()
+            } finally {
+                $job.Pipeline.Dispose()
+            }
+        }
+        $pool.Dispose()
+        Write-Progress -Id 2 -Activity 'Resolving blocked domains' -Completed
+    }
 }
 
 # Resolve block-list domains that did not match any discovered-app page.
@@ -410,37 +615,33 @@ function Get-UnmatchedBlockDomainApps {
         [string[]]$BlockDomains,
         [hashtable]$MatchedDomains,
         [hashtable]$MatchedAppIds,
-        [Microsoft.PowerShell.Commands.WebRequestSession]$Session
+        [Microsoft.PowerShell.Commands.WebRequestSession]$Session,
+        [ValidateRange(1, 8)]
+        [int]$Concurrency = 4
     )
 
-    $unsanctioned = @()
+    $unsanctioned = [System.Collections.Generic.List[object]]::new()
     $remainingDomains = @($BlockDomains | Where-Object { -not $MatchedDomains.ContainsKey($_) })
     $catalogMatchesByAppId = @{}
 
     if ($remainingDomains.Count -gt 0) {
         Write-Log "Resolving $($remainingDomains.Count) unmatched blocked domains against the Cloud App Catalog..."
-        $domainIndex = 0
-        foreach ($domain in $remainingDomains) {
-            $domainIndex++
-            $percentComplete = [int](100 * $domainIndex / $remainingDomains.Count)
-            Write-Progress -Id 2 -Activity "Resolving blocked domains" -Status "$domainIndex of $($remainingDomains.Count) checked" -PercentComplete $percentComplete
-            $catalogApp = Get-AppCatalogAppByDomain -Domain $domain -Session $Session
-            if (-not $catalogApp.appId) {
-                continue
-            }
-
-            $catalogAppKey = "appId:$($catalogApp.appId)"
-            if (-not $catalogMatchesByAppId.ContainsKey($catalogAppKey)) {
-                $catalogMatchesByAppId[$catalogAppKey] = [pscustomobject]@{
-                    App     = $catalogApp
-                    Domains = New-Object System.Collections.Generic.List[string]
+        Get-CatalogAppsByDomain -Domains $remainingDomains -Session $Session -Concurrency $Concurrency | ForEach-Object {
+            $domain = $_.Domain
+            $catalogApp = $_.App
+            if ($catalogApp.appId) {
+                $catalogAppKey = "appId:$($catalogApp.appId)"
+                if (-not $catalogMatchesByAppId.ContainsKey($catalogAppKey)) {
+                    $catalogMatchesByAppId[$catalogAppKey] = [pscustomobject]@{
+                        App     = $catalogApp
+                        Domains = New-Object System.Collections.Generic.List[string]
+                    }
                 }
-            }
 
-            $catalogMatchesByAppId[$catalogAppKey].Domains.Add($domain)
-            $MatchedDomains[$domain] = $true
+                $catalogMatchesByAppId[$catalogAppKey].Domains.Add($domain)
+                $MatchedDomains[$domain] = $true
+            }
         }
-        Write-Progress -Id 2 -Activity "Resolving blocked domains" -Completed
     }
     
     foreach ($catalogAppKey in $catalogMatchesByAppId.Keys) {
@@ -451,14 +652,14 @@ function Get-UnmatchedBlockDomainApps {
         
         $catalogMatch = $catalogMatchesByAppId[$catalogAppKey]
         $domains = @($catalogMatch.Domains | Sort-Object -Unique)
-        $unsanctioned += [pscustomobject]@{
+        $unsanctioned.Add([pscustomobject]@{
             name                = $catalogMatch.App.name
             appId               = $catalogMatch.App.appId
             Domains             = ($domains -join ", ")
             DomainCount         = $domains.Count
             banned              = $true
             UnsanctionedSource  = "CloudAppCatalog"
-        }
+        })
     }
     
     $unmatchedDomainGroups = @($BlockDomains |
@@ -468,18 +669,18 @@ function Get-UnmatchedBlockDomainApps {
     foreach ($group in $unmatchedDomainGroups) {
         $domains = @($group.Group | Sort-Object -Unique)
         if ($domains.Count -gt 0) {
-            $unsanctioned += [pscustomobject]@{
+            $unsanctioned.Add([pscustomobject]@{
                 name                = $group.Name
                 appId               = $null
                 Domains             = ($domains -join ", ")
                 DomainCount         = $domains.Count
                 banned              = $true
                 UnsanctionedSource  = "GlobalBlockListAppKeyGroup"
-            }
+            })
         }
     }
     
-    return $unsanctioned
+    return $unsanctioned.ToArray()
 }
 
 # Function to search for app (uses cache)
@@ -692,9 +893,10 @@ Write-Log "API Connection Successful!" -Level "SUCCESS"
 
 # Fetch discovered apps in pages, but create exports in batches of 250 unsanctioned results.
 $blockDomains = @(Get-UnsanctionedBlockDomains -Session $session | ForEach-Object { $_.ToLowerInvariant() } | Sort-Object -Unique)
+$blockDomainIndex = New-BlockDomainIndex -BlockDomains $blockDomains
 $matchedDomains = @{}
 $matchedAppIds = @{}
-$unsanctionedApps = @()
+$unsanctionedApps = [System.Collections.Generic.List[object]]::new()
 $pendingUnsanctionedApps = [System.Collections.Generic.List[object]]::new()
 $discoveredAppsProcessed = 0
 $pageLimit = 250
@@ -719,10 +921,10 @@ while ($true) {
     }
 
     $discoveredAppsProcessed += $pageApps.Count
-    $pageUnsanctionedApps = @(Get-UnsanctionedApps -Apps $pageApps -BlockDomains $blockDomains -MatchedDomains $matchedDomains -MatchedAppIds $matchedAppIds)
+    $pageUnsanctionedApps = @(Get-UnsanctionedApps -Apps $pageApps -BlockDomainIndex $blockDomainIndex -MatchedDomains $matchedDomains -MatchedAppIds $matchedAppIds)
     foreach ($app in $pageUnsanctionedApps) {
         $pendingUnsanctionedApps.Add($app)
-        $unsanctionedApps += $app
+        $unsanctionedApps.Add($app)
     }
 
     Write-Log "Processed discovered apps $($skip + 1)-$($skip + $pageApps.Count): $($pageApps.Count) records; $($pageUnsanctionedApps.Count) unsanctioned groups." -Level "SUCCESS"
@@ -738,10 +940,10 @@ while ($true) {
 Write-Progress -Id 1 -Activity "Scanning discovered apps" -Completed
 
 # Resolve remaining blocked domains, then flush full and final partial result batches.
-$remainingBlockListApps = @(Get-UnmatchedBlockDomainApps -BlockDomains $blockDomains -MatchedDomains $matchedDomains -MatchedAppIds $matchedAppIds -Session $session)
+$remainingBlockListApps = @(Get-UnmatchedBlockDomainApps -BlockDomains $blockDomains -MatchedDomains $matchedDomains -MatchedAppIds $matchedAppIds -Session $session -Concurrency $catalogLookupConcurrency)
 foreach ($app in $remainingBlockListApps) {
     $pendingUnsanctionedApps.Add($app)
-    $unsanctionedApps += $app
+    $unsanctionedApps.Add($app)
 }
 
 $exportBatchNumber = Export-ReadyUnsanctionedBatches -PendingRecords $pendingUnsanctionedApps -BatchSize $exportBatchSize -NextBatchNumber $exportBatchNumber -RunId $runId -OutputDirectory $PSScriptRoot -IncludeRemainder
@@ -762,5 +964,4 @@ Write-Log "`n===== Complete ====="
 Write-Log "Duration: $($duration.TotalSeconds) seconds"
 
 # Return the apps so the caller/pipeline can use them
-$unsanctionedApps
-
+$unsanctionedApps.ToArray()
