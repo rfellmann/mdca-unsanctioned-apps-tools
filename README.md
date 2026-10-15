@@ -23,7 +23,7 @@ PowerShell helpers for Microsoft Defender for Cloud Apps / Microsoft security po
 - Transient JSON API failures are retried up to three total attempts, honoring the service's `Retry-After` header when supplied.
 - Discovered apps are still retrieved sequentially in pages of 250. Results are exported in batches of 250 to one timestamped CSV; the final partial batch is also exported.
 - Failed page or catalog requests stop the run to avoid silently omitting results. CSV batches already written remain on disk and must be treated as partial if the run fails.
-- The script remains read-only and supports Windows PowerShell 5.1 and PowerShell 7 on Windows.
+- The script remains read-only and supports PowerShell 7 on Windows. Windows PowerShell 5.1 is not supported.
 
 Never commit real authentication cookies, tenant IDs, or generated customer exports. Use fresh cookies from the helper when the session expires.
 
@@ -36,7 +36,7 @@ Never commit real authentication cookies, tenant IDs, or generated customer expo
 - Matching results from each discovery page are immediately appended to `MDCA_SanctionedApps_<timestamp>.csv`. Remaining domain results are appended after all catalog lookups finish. The columns are `AppNameOrDomainGroup`, `AppId`, `Source`, `DomainCount`, and `Domains`; each exported set is also copied to the clipboard.
 - Failed runs leave partial CSV files. Only the Complete message indicates that discovery and catalog resolution finished.
 - The sanctioned-domain endpoint approach is demonstrated by this [public implementation](https://github.com/mattnovitsch/M365/blob/main/MDA/MDA-SanctionedApps-Template.ps1), but is not yet verified against the customer's live tenant. Compare the export with the portal before relying on it; unexpected nonempty domain-export formats stop the run.
-- The script is read-only and compatible with Windows PowerShell 5.1 and PowerShell 7 on Windows.
+- The script is read-only and supports PowerShell 7 on Windows. Windows PowerShell 5.1 is not supported.
 
 ## Support Statement
 - These are custom scripts and not an official Microsoft product; no support is provided by Microsoft. MDCA API capabilities used by this script might change over time.
