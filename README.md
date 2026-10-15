@@ -6,7 +6,7 @@ PowerShell helpers for Microsoft Defender for Cloud Apps / Microsoft security po
 
 - `Get-MDCACookies.ps1` opens `security.microsoft.com`, extracts the required session cookies from that controlled browser session, and provides separate copy buttons for `sccauth` and `XSRF-TOKEN`.
 - `Get-UnsanctionedMDCAApps.ps1` authenticates against the MCAS v1 API using the extracted session cookies and exports unsanctioned app/domain results in an Excel-friendly format.
-- `Get-SanctionedMDCAApps.ps1` uses the same cookie authentication to scan discovered apps and the Cloud App Catalog for sanctioned apps, deduplicate by app ID, and export results after every matching page.
+- `Get-SanctionedMDCAApps.ps1` uses the same cookie authentication to match discovered apps against the global sanctioned-domain export, resolve remaining domains through the Cloud App Catalog, and deduplicate by app ID.
 
 ## Before Running
 
@@ -29,11 +29,13 @@ Never commit real authentication cookies, tenant IDs, or generated customer expo
 
 ## Sanctioned Export
 
-- Scans discovered apps and the Cloud App Catalog sequentially in pages of up to 250, including catalog-only sanctioned apps. It does not use the unsanctioned block-list endpoint or per-domain catalog workers.
-- An explicit Boolean `sanctioned: true` identifies a sanctioned app. When that field is absent, the script expects the portal's tri-state `banned` field: `false` means sanctioned, `true` means unsanctioned, and `null` means untagged. This status interpretation has not been verified against a live tenant; compare the export with the portal before relying on it.
-- Missing, unexpected, or contradictory status fields stop the export instead of guessing.
-- Matching results from each page are immediately appended to `MDCA_SanctionedApps_<timestamp>.csv`. The columns are `AppNameOrDomainGroup`, `AppId`, `Source`, `DomainCount`, and `Domains`; the latest matching page is also copied to the clipboard.
-- Failed runs leave partial CSV files. Only the Complete message indicates that both source scans finished.
+- Retrieves the global sanctioned-domain list using `discovery_block_scripts/?format=102&type=sanctioned`, then matches discovered-app pages against a suffix index. Missing `sanctioned`/`banned` fields no longer stop matching.
+- Domain-list membership, an explicit Boolean `sanctioned: true`, or a string `SANCTIONED` tag identifies a sanctioned result. `banned: false` alone is not treated as proof of sanctioning.
+- Resolves remaining sanctioned domains with up to four concurrent Cloud App Catalog workers. Set `$catalogLookupConcurrency` to `2` or `1` if throttling is frequent (supported range: `1` through `8`).
+- Sanctioned domains with no catalog match are retained as `GlobalSanctionedDomain` rows with no app ID; these are domain records, not confirmed catalog apps.
+- Matching results from each discovery page are immediately appended to `MDCA_SanctionedApps_<timestamp>.csv`. Remaining domain results are appended after all catalog lookups finish. The columns are `AppNameOrDomainGroup`, `AppId`, `Source`, `DomainCount`, and `Domains`; each exported set is also copied to the clipboard.
+- Failed runs leave partial CSV files. Only the Complete message indicates that discovery and catalog resolution finished.
+- The sanctioned-domain endpoint approach is demonstrated by this [public implementation](https://github.com/mattnovitsch/M365/blob/main/MDA/MDA-SanctionedApps-Template.ps1), but is not yet verified against the customer's live tenant. Compare the export with the portal before relying on it; unexpected nonempty domain-export formats stop the run.
 - The script is read-only and compatible with Windows PowerShell 5.1 and PowerShell 7 on Windows.
 
 ## Support Statement
